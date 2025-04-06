@@ -1,0 +1,27 @@
+# requirements.txt for CUDA 11.x/12.x environments
+
+# PyTorch (ensure you install the correct CUDA-enabled version separately if needed)
+torch>=2.5.1,<2.6.0
+
+# Hugging Face libraries for models and datasets
+transformers
+datasets
+accelerate
+
+# Other utilities
+tqdm
+humanize
+
+# Web server and API dependencies (if needed)
+fastapi
+uvicorn
+python-multipart
+
+# bitsandbytes:
+# For Linux/Mac, you can install from PyPI:
+# bitsandbytes
+#
+# For Windows users, install bitsandbytes from the provided URL:
+# pip install https://github.com/jllllll/bitsandbytes-windows-webui/releases/download/wheels/bitsandbytes
+
+optuna

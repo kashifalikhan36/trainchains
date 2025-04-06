@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+
+import os
+import io
+import time
+import argparse
+import logging
+import torch
+import torch.optim as optim
+import torch.nn.utils as nn_utils
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast, GradScaler
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import requests
+import optuna
+import json
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+def local_hyperparam_search():
+    """
+    Performs a local Optuna-based hyperparameter search on the GPU client.
+    Fallback if server hyperparams not ready.
+    """
+    import optuna
+
+    def local_objective(trial: optuna.Trial) -> float:
+        # Lower range to reduce chance of NaNs
+        lr = trial.suggest_float("lr", 1e-6, 1e-4, log=True)
+        epochs = trial.suggest_int("epochs", 1, 3)
+        batch_size = trial.suggest_categorical("batch_size", [1, 2])
+        max_length = trial.suggest_int("max_length", 64, 128)
+
+        # Dummy scoring function (maximize)
+        dummy_score = 1.0 / (lr * epochs * batch_size * (max_length / 64))
+        return dummy_score
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(local_objective, timeout=300)
+    return study.best_params
+
+def post_local_hyperparams_to_server(server_addr: str, hyperparams: dict):
+    """
+    Submit local hyperparams to server if none are found there.
+    """
+    try:
+        resp = requests.post(f"{server_addr}/submit_hyperparameters", json=hyperparams, timeout=30)
+        if resp.status_code == 200:
+            logging.info("[Client] Successfully submitted local hyperparams to server.")
+        else:
+            logging.warning(f"[Client] Server returned status code: {resp.status_code}")
+    except Exception as e:
+        logging.error(f"[Client] Could not submit local hyperparams: {e}")
+
+def get_server_hyperparameters(server_addr: str):
+    """
+    Fetch best hyperparameters from server.
+    Returns None if not ready.
+    """
+    try:
+        resp = requests.get(f"{server_addr}/get_hyperparameters", timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 503:
+            logging.info("[Client] Hyperparameters not yet ready on server.")
+            return None
+        else:
+            logging.warning(f"[Client] Unknown response code: {resp.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"[Client] Could not retrieve hyperparameters: {e}")
+        return None
+
+def get_server_dataset_shard(server_addr: str, client_id: int, total_clients: int):
+    """
+    Fetch dataset shard from server.
+    """
+    try:
+        shard_resp = requests.get(
+            f"{server_addr}/get_dataset_shard",
+            params={"client_id": client_id, "total_clients": total_clients},
+            timeout=60
+        )
+        if shard_resp.status_code == 200:
+            return shard_resp.json()
+        else:
+            logging.error(f"[Client] Dataset shard error code: {shard_resp.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"[Client] Failed to retrieve dataset shard: {e}")
+        return None
+
+def notify_server_of_gpu_start(server_addr: str):
+    """
+    Notify server GPU is available, so it can stop CPU-based search.
+    """
+    try:
+        resp = requests.get(f"{server_addr}/gpu_has_arrived", timeout=20)
+        if resp.status_code != 200:
+            logging.warning(f"[Client] GPU start notification returned {resp.status_code}")
+    except Exception as e:
+        logging.warning(f"[Client] GPU start notification failed: {e}")
+
+def notify_server_of_gpu_finish(server_addr: str):
+    """
+    Notify server GPU is finished. Frees up GPU slot on server.
+    """
+    try:
+        resp = requests.post(f"{server_addr}/gpu_slot_finish", timeout=20)
+        if resp.status_code != 200:
+            logging.warning(f"[Client] GPU finish notification returned {resp.status_code}")
+    except Exception as e:
+        logging.warning(f"[Client] GPU finish notification failed: {e}")
+
+def train(hyperparams: dict, problems: list, answers: list, server_addr: str):
+    """
+    Training loop for demonstration. Attempts to reduce NaNs via clipping, smaller LR, etc.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"[Client] Training on {device}...")
+
+    # Inform server that a GPU is in use
+    notify_server_of_gpu_start(server_addr)
+
+    # Lower default learning rate to help reduce NaNs
+    lr = hyperparams.get("lr", 5e-6)
+    epochs = hyperparams.get("epochs", 2)
+    batch_size = hyperparams.get("batch_size", 1)
+    max_length = hyperparams.get("max_length", 128)
+
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
+    tokenizer.pad_token = tokenizer.eos_token
+
+    class TextDataset(Dataset):
+        def __init__(self, texts, labels, tok, max_len):
+            self.samples = [f"{t} {l}" for t, l in zip(texts, labels)]
+            self.tokenizer = tok
+            self.max_length = max_len
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            enc = self.tokenizer(
+                self.samples[idx],
+                max_length=self.max_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt"
+            )
+            return {k: v.squeeze(0) for k, v in enc.items()}
+
+    dataset_obj = TextDataset(problems, answers, tokenizer, max_length)
+    dataloader = DataLoader(
+        dataset_obj,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0 if os.name == 'nt' else 4
+    )
+
+    model = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M").to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    scaler = GradScaler()
+
+    total_steps = len(dataloader) * epochs
+    start_time = time.time()
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0.0
+        for step, batch in enumerate(dataloader):
+            inputs = batch["input_ids"].to(device)
+            labels = inputs.clone()
+
+            with autocast(device_type="cuda"):
+                outputs = model(inputs, labels=labels)
+                loss = outputs.loss
+
+            if torch.isnan(loss):
+                logging.error("[Client] Loss is NaN. Exiting training loop.")
+                break
+
+            scaler.scale(loss).backward()
+            nn_utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+            epoch_loss += loss.item()
+            if step % 10 == 0:
+                logging.info(f"[Epoch {epoch} Step {step}] Loss: {loss.item():.4f}")
+                steps_done = epoch * len(dataloader) + (step + 1)
+                elapsed_time = time.time() - start_time
+                avg_time_per_step = elapsed_time / steps_done if steps_done > 0 else 0
+                steps_left = total_steps - steps_done
+                remaining_time = steps_left * avg_time_per_step
+                logging.info(f"[Client] Approx. remaining training time: {remaining_time:.2f}s")
+
+        logging.info(f"[Epoch {epoch}] Loss: {epoch_loss / max(1, step+1):.4f}")
+
+        # If broke out due to NaN, skip remaining epochs
+        if torch.isnan(loss):
+            break
+
+    # Notify server that GPU usage is complete
+    notify_server_of_gpu_finish(server_addr)
+
+    # Save model as bytes for uploading
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+def run_client(aggregator_addr: str, server_addr: str, client_id: int, total_clients: int):
+    """
+    Full pipeline: get (or find) hyperparams, get data shard, train, upload model to aggregator.
+    """
+    # Ensure aggregator address has a proper scheme
+    if not aggregator_addr.startswith("http://") and not aggregator_addr.startswith("https://"):
+        aggregator_addr = "http://" + aggregator_addr
+
+    # Pull hyperparams from server, or do local search if not available
+    hyperparams = get_server_hyperparameters(server_addr)
+    if hyperparams is None:
+        logging.info("[Client] Server hyperparams not ready. Performing local hyperparam search.")
+        local_params = local_hyperparam_search()
+        logging.info(f"[Client] Local hyperparams found: {local_params}")
+
+        post_local_hyperparams_to_server(server_addr, local_params)
+        time.sleep(2)
+
+        hyperparams = get_server_hyperparameters(server_addr)
+        if hyperparams is None:
+            logging.info("[Client] Still no hyperparams from server, using local hyperparams anyway.")
+            hyperparams = local_params
+
+    shard_data = get_server_dataset_shard(server_addr, client_id, total_clients)
+    if not shard_data or "problems" not in shard_data or "answers" not in shard_data:
+        logging.error("[Client] No usable shard data received. Exiting.")
+        return
+
+    problems = shard_data["problems"]
+    answers = shard_data["answers"]
+
+    model_bytes = train(hyperparams, problems, answers, server_addr)
+
+    # Upload model to aggregator
+    url = f"{aggregator_addr}/upload_client_model"
+    files = {"model": ("client_model.pth", model_bytes)}
+
+    try:
+        resp = requests.post(url, files=files, timeout=60)
+        logging.info(f"[Client] Model upload response: {resp.text}")
+    except Exception as e:
+        logging.error(f"[Client] Failed to upload model: {e}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="GPU-based client for federated training")
+    parser.add_argument("--aggregator_addr", required=True, help="Aggregator address e.g. http://<IP>:<Port>")
+    parser.add_argument("--server_addr", required=True, help="Server address e.g. http://<IP>:<Port>")
+    parser.add_argument("--client_id", type=int, default=0, help="Client index (0-based)")
+    parser.add_argument("--total_clients", type=int, default=2, help="Total clients in federation")
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        logging.error("[Client] No CUDA device found. Exiting.")
+        exit(1)
+
+    run_client(
+        aggregator_addr=args.aggregator_addr,
+        server_addr=args.server_addr,
+        client_id=args.client_id,
+        total_clients=args.total_clients
+    )

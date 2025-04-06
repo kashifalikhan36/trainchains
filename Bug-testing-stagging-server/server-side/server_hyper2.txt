@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+
+import os
+import io
+import time
+import json
+import argparse
+import logging
+import threading
+import multiprocessing
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+import uvicorn
+from datasets import load_dataset
+import optuna
+import torch
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+# Global variables
+server_dataset = None
+best_hyperparams = None
+hyperparams_file = "best_hyperparams.json"
+aggregator_state_file = "aggregator_state.json"
+
+gpu_has_arrived_event = threading.Event()
+stop_cpu_search_event = threading.Event()
+
+hyperparam_lock = threading.Lock()
+cpu_pruned_once = False  # Prevent repeated prune logging
+
+def create_or_update_state_file(num_clients: int = 2):
+    """
+    Initialize or update aggregator state. This file tracks resource slot usage.
+    """
+    state = {
+        "no_of_slot_available": num_clients,
+        "active_slot": 0
+    }
+    with open(aggregator_state_file, "w") as f:
+        json.dump(state, f, indent=2)
+
+def update_state_on_gpu_start():
+    """
+    Decrement an available slot and mark the GPU slot as active.
+    """
+    if not os.path.exists(aggregator_state_file):
+        return
+    with open(aggregator_state_file, "r") as f:
+        state = json.load(f)
+    if state["no_of_slot_available"] > 0:
+        state["active_slot"] = 1
+        state["no_of_slot_available"] -= 1
+    with open(aggregator_state_file, "w") as f:
+        json.dump(state, f, indent=2)
+
+def update_state_on_gpu_finish():
+    """
+    Free the GPU slot and increment the available count.
+    """
+    if not os.path.exists(aggregator_state_file):
+        return
+    with open(aggregator_state_file, "r") as f:
+        state = json.load(f)
+    state["active_slot"] = 0
+    state["no_of_slot_available"] += 1
+    with open(aggregator_state_file, "w") as f:
+        json.dump(state, f, indent=2)
+
+def objective(trial: optuna.Trial) -> float:
+    """
+    A dummy objective function for hyperparameter search.
+    If a GPU arrives during CPU-based search, we prune the trial.
+    """
+    global cpu_pruned_once
+    if stop_cpu_search_event.is_set():
+        if not cpu_pruned_once:
+            logging.info("[Server] CPU-based search pruned because GPU arrived.")
+            cpu_pruned_once = True
+        raise optuna.TrialPruned("CPU-based search stopped; GPU arrived.")
+
+    lr = trial.suggest_float("lr", 1e-6, 1e-2, log=True)
+    epochs = trial.suggest_int("epochs", 1, 10)
+    batch_size = trial.suggest_categorical("batch_size", [2, 4, 8, 16, 32])
+    max_length = trial.suggest_int("max_length", 64, 1024)
+
+    device = "cuda" if (torch.cuda.is_available() and gpu_has_arrived_event.is_set()) else "cpu"
+
+    if device == "cuda":
+        update_state_on_gpu_start()
+
+    # Dummy training steps
+    dummy_tensor = torch.rand(100, 100, device=device)
+    for _ in range(epochs):
+        if stop_cpu_search_event.is_set():
+            if not cpu_pruned_once:
+                logging.info("[Server] CPU-based search pruned mid-run because GPU arrived.")
+                cpu_pruned_once = True
+            raise optuna.TrialPruned("CPU-based search pruned mid-run; GPU arrived.")
+        dummy_tensor *= lr
+
+    if device == "cuda":
+        update_state_on_gpu_finish()
+
+    # Lower score is "better" in this dummy example
+    score = 1.0 / (lr * epochs * batch_size * (max_length / 128))
+    return score
+
+def run_optuna_search(use_gpu_first: bool):
+    """
+    Performs the Optuna-based hyperparameter search if no hyperparameters exist yet.
+    """
+    global best_hyperparams
+
+    # If hyperparams already exist, skip searching.
+    if best_hyperparams is not None:
+        logging.info("[Server] Hyperparameters already set. Skipping Optuna search.")
+        return
+
+    def do_study(mode: str):
+        logging.info(f"[Server] Starting Optuna study on {mode.upper()}.")
+        study = optuna.create_study(direction="minimize")
+        cpu_count = multiprocessing.cpu_count()
+        study.optimize(objective, timeout=1800, n_jobs=cpu_count)  # 30-minute limit
+        return study.best_trial
+
+    if use_gpu_first and torch.cuda.is_available():
+        with hyperparam_lock:
+            trial = do_study("gpu")
+            best_hyperparams = trial.params
+    else:
+        stop_cpu_search_event.clear()
+        try:
+            with hyperparam_lock:
+                trial = do_study("cpu")
+                best_hyperparams = trial.params
+        except optuna.TrialPruned:
+            logging.info("[Server] CPU-based search pruned. Waiting 30 minutes for GPU-based hyperparameters.")
+            time.sleep(30 * 60)
+            if best_hyperparams is None:
+                logging.info("[Server] No GPU-based hyperparams found in 30 minutes. Retrying CPU-based search.")
+                stop_cpu_search_event.clear()
+                with hyperparam_lock:
+                    trial = do_study("cpu")
+                    best_hyperparams = trial.params
+
+def background_wait_and_optimize():
+    """
+    Background thread that waits up to 30 minutes for a GPU to arrive.
+    If hyperparameters are already set, we skip searching.
+    """
+    global best_hyperparams
+
+    if best_hyperparams is not None:
+        logging.info("[Background] Hyperparameters already exist, skipping search.")
+        return
+
+    logging.info("[Background] Waiting up to 30 minutes for GPU to arrive before starting hyperparam search...")
+    got_gpu = gpu_has_arrived_event.wait(timeout=1800)
+    if got_gpu:
+        run_optuna_search(use_gpu_first=True)
+    else:
+        run_optuna_search(use_gpu_first=False)
+
+app = FastAPI()
+
+@app.on_event("startup")
+def startup_event():
+    """
+    Loads the dataset and either runs or skips hyperparameter search, depending on whether
+    hyperparameters are already present or not.
+    """
+    global server_dataset
+    global best_hyperparams
+
+    create_or_update_state_file(2)
+    logging.info("[Server] Loading dataset at startup...")
+    server_dataset = load_dataset("open-r1/OpenR1-Math-220k")
+    logging.info("[Server] Dataset loaded successfully.")
+
+    # If hyperparameters are already found or saved, skip new search
+    if os.path.exists(hyperparams_file):
+        with open(hyperparams_file, "r") as f:
+            best_hyperparams = json.load(f)
+        logging.info("[Server] Hyperparameters loaded from local file.")
+
+    # If best_hyperparams is still None, start the background thread to wait or search
+    if best_hyperparams is None:
+        thread = threading.Thread(target=background_wait_and_optimize, daemon=True)
+        thread.start()
+    else:
+        logging.info("[Server] Hyperparameters previously set. No new search needed.")
+
+@app.get("/gpu_has_arrived")
+def gpu_has_arrived():
+    """
+    GPU-based client notifies the server that GPU is available. This triggers stopping CPU-based search if active.
+    """
+    if not gpu_has_arrived_event.is_set():
+        gpu_has_arrived_event.set()
+        stop_cpu_search_event.set()
+        logging.info("[Server] GPU arrived.")
+    return {"message": "GPU acknowledged. CPU search will be stopped if running."}
+
+@app.post("/gpu_slot_finish")
+def gpu_slot_finish():
+    """
+    GPU-based client notifies that the GPU is finishing/available. Frees GPU slot usage.
+    """
+    update_state_on_gpu_finish()
+    return {"message": "GPU slot has been freed."}
+
+@app.post("/submit_hyperparameters")
+async def submit_hyperparameters(hyperparams: dict):
+    """
+    Endpoint for a GPU or external process to submit discovered hyperparams.
+    Once saved, the server should not repeat the hyperparameter search.
+    """
+    global best_hyperparams
+    best_hyperparams = hyperparams
+    with open(hyperparams_file, "w") as f:
+        json.dump(hyperparams, f, indent=2)
+    logging.info(f"[Server] Received and saved hyperparameters: {hyperparams}")
+    return {"message": "Hyperparameters received"}
+
+@app.get("/get_hyperparameters")
+def get_hyperparameters():
+    """
+    Endpoint to retrieve the best hyperparameters found.
+    Raises 503 if not available yet.
+    """
+    global best_hyperparams
+    if best_hyperparams is None:
+        # Check file in case they arrived while the server was running
+        if os.path.exists(hyperparams_file):
+            with open(hyperparams_file, "r") as f:
+                best_hyperparams = json.load(f)
+        else:
+            raise HTTPException(status_code=503, detail="Hyperparameters not yet available.")
+    return best_hyperparams
+
+@app.get("/get_dataset_shard")
+def get_dataset_shard(client_id: int, total_clients: int):
+    """
+    Endpoint to provide a slice of training data for each client.
+    """
+    if not server_dataset or "train" not in server_dataset:
+        raise HTTPException(status_code=500, detail="Dataset not loaded.")
+    if client_id < 0 or client_id >= total_clients:
+        raise HTTPException(status_code=400, detail="Invalid client_id or total_clients.")
+
+    # Uncomment below line to limit dataset size for faster testing:
+    # server_dataset["train"] = server_dataset["train"].select(range(100))
+
+    train_data = server_dataset["train"]
+    data_len = len(train_data)
+    shard_size = data_len // total_clients
+    start_idx = client_id * shard_size
+    end_idx = start_idx + shard_size
+    if client_id == total_clients - 1:
+        end_idx = data_len
+
+    subset = train_data.select(range(start_idx, end_idx))
+    return {"problems": subset["problem"], "answers": subset["answer"]}
+
+@app.post("/upload_model")
+async def upload_model(model: UploadFile = File(...)):
+    """
+    Endpoint to allow clients to upload a partially trained or integrated model.
+    """
+    contents = await model.read()
+    try:
+        _ = torch.load(io.BytesIO(contents), map_location="cpu")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load model: {e}")
+    filename = f"integrated_model_{int(time.time())}.pth"
+    with open(filename, "wb") as f:
+        f.write(contents)
+    logging.info(f"[Server] Integrated model received and saved as {filename}")
+    return {"message": "Model received", "path": filename}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Server for GPU-based hyperparam use and data shard distribution")
+    parser.add_argument("--port", type=int, default=5000, help="Port")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host")
+    args = parser.parse_args()
+
+    uvicorn.run(app, host=args.host, port=args.port)

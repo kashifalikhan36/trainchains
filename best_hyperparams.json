@@ -1,0 +1,6 @@
+{
+    "lr": 1.999985841863153,
+    "epochs": 2,
+    "batch_size": 4,
+    "max_length": 64
+}
